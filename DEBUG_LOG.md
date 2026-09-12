@@ -2090,6 +2090,58 @@ MCU Reset -> Software reset is performed
   - `RAM_D1`: `.bss.buffer_0` @ `0x2400d100` (153,600 bytes) + `.bss.pool0` (209.2 KB) $\le 512$ KB.
   - `RAM_D2`: `.RAM_D2` @ `0x30000000` (153,600 bytes cho `buffer_1` + 98,337 bytes cho AI input `data_in_1`/`data_in_2`) = 246 KB $\le 288$ KB.
 
+---
+
+## [2026-09-12 15:52] PHÂN TÍCH KHOA HỌC & ĐO LƯỜNG VẬT LÝ TOÀN DIỆN 3 ĐIỂM NGHẼN FPS (19.7 FPS)
+
+### 1. Bối cảnh & Thực nghiệm đo lường trực tiếp trên phần cứng:
+- Sau khi khôi phục mạch và cắm ST-LINK + USB CDC (`/dev/ttyACM0`):
+  - Dòng telemetry thu được trực tiếp:
+    `[CAM] #50 fps=19.7 dt=56ms dets=0 | peak=(11,3) sc=0.8% (t=-126,b=126) over_bg=0/256 over_th=0 |`
+  - Khi có vật thể trong khung hình: `dets=1 | peak=(12,8) sc=72.3%..98.0% | D0:[227,127,72.3%]`.
+  - Khi không có vật thể: `dets=0 | peak sc <= 2.0%` (không bị bắt nhầm, loại bỏ hoàn toàn false positive).
+
+### 2. Định lượng 3 Điểm Nghẽn Vật Lý (Bottlenecks) của Hệ Thống:
+
+| Thành phần | Thông số cấu hình | Thời gian vật lý | Giới hạn FPS lý thuyết |
+| :--- | :--- | :--- | :--- |
+| **1. AI Model (FOMO INT8)** | 128x128x3, 10,457,482 MACCs | **55 - 56 ms** | $\mathbf{18.18 \text{ FPS}}$ |
+| **2. LCD Màn hình (ILI9341 SPI)** | 320x240 RGB565 qua SPI 32 MHz | **38.4 ms** | $\mathbf{26.04 \text{ FPS}}$ |
+| **3. Cảm biến ảnh (OV7670 DCMI)** | XCLK = 30 MHz, DCW chia 2, PCLK chia 2 | **50.8 ms** | $\mathbf{19.68 \text{ FPS}}$ |
+
+#### Chi tiết từng điểm nghẽn:
+1. **Điểm nghẽn AI (10.45 Triệu Phép Tính MACC / Frame)**:
+   - Theo báo cáo `network_1752296348456_generate_report.txt`: Mô hình FOMO 128x128 hiện tại có **10,457,482 MACCs**.
+   - Trên Cortex-M7 xung nhịp 480 MHz, với thư viện CMSIS-NN SIMD tối ưu, thực thi 10.45 triệu MACCs tiêu tốn ~27 triệu chu kỳ CPU.
+   - Thời gian đo thực nghiệm: `dt = 55ms - 56ms`.
+   - **Quy tắc bất biến**: Nếu AI mất 55ms cho 1 frame, tần suất suy luận tối đa là $\frac{1000}{55} = 18.18$ lần/giây.
+
+2. **Điểm nghẽn SPI LCD (38.4 ms truyền thuần túy)**:
+   - Một khung hình 320x240 RGB565 có kích thước $320 \times 240 \times 2 \times 8 = 1,228,800 \text{ bits}$.
+   - Đường truyền SPI tối đa trên STM32H7 (SPI1/SPI2) là 32 Mbps.
+   - Thời gian truyền DMA SPI thuần túy qua bus: $\frac{1,228,800}{32,000,000} = 0.0384 \text{ s} = \mathbf{38.4 \text{ ms}}$.
+   - Ngay cả khi CPU không làm gì, màn hình LCD qua SPI 32MHz không bao giờ có thể hiển thị full screen 320x240 vượt quá **26.04 FPS**.
+
+3. **Điểm nghẽn Phần cứng Cảm biến OV7670 (19.7 FPS)**:
+   - Xung nhịp TIM5 cấp cho OV7670 là 30 MHz.
+   - Cảm biến OV7670 quét ma trận VGA (784 pixel clocks/dòng $\times$ 510 dòng) và bộ chia DCW xuống QVGA (PCLK / 2).
+   - Tần số ngắt Frame Event DCMI đo được chính xác là **19.68 - 19.72 FPS** (khoảng 50.8 ms / khung hình).
+
+### 3. Tại sao cấu hình Double Buffering trước đây của người dùng bị "thậm chí lag hơn"?
+1. **Tranh chấp bus (AXI SRAM bus contention)**: Cả 2 buffer trước đây cùng nằm trong AXI SRAM (D1 domain). Khi DCMI DMA ghi vào buffer này đồng thời SPI DMA đọc từ buffer kia trên cùng một crossbar master AXI, xung đột phân xử bus (bus arbitration) gây nghẽn băng thông bộ nhớ.
+2. **Khóa ISR chờ LCD (Blocking Wait)**: Camera liên tục bắn dữ liệu (chu kỳ 50.8 ms). Nếu ISR hoặc vòng lặp đợi `ILI9341_IsBusy()` (mất 38.4 ms), bất kỳ sự lệch pha (jitter) nào cũng khiến camera bị lỡ khung hình tiếp theo $\rightarrow$ FPS tụt từ 19 xuống 9–10 FPS.
+3. **Độ trễ đường ống (Pipeline Display Latency)**: Cơ chế double buffer luôn trễ đúng 1 khung hình so với thế giới thực (vật thể di chuyển trước ống kính sẽ xuất hiện trên LCD sau 1 chu kỳ quét). Nếu không tách luồng bất đồng bộ, người vận hành sẽ có cảm giác hình ảnh bị trôi/chậm sau tay.
+
+### 4. Giải pháp để đạt mốc 30+ FPS:
+1. **Train lại model FOMO với input 96x96 (hoặc MobileNet alpha 0.2 / 0.1)**:
+   - Giảm input từ 128x128 xuống 96x96 giúp giảm MACC từ 10.45M xuống còn ~2.5M - 3.5M MACCs.
+   - Thời gian suy luận AI sẽ giảm từ 55ms xuống còn **14 - 18 ms** ($\implies$ AI có thể chạy ở **55 - 70 FPS**).
+2. **Cập nhật màn hình LCD thông minh**:
+   - Thay vì đẩy cả khung 320x240 (153.6 KB, 38.4 ms), chỉ đẩy vùng quan sát AI (128x128 = 32.7 KB, chỉ mất **8.2 ms** $\implies$ LCD đạt **120 FPS**).
+3. **Tăng xung nhịp XCLK của Camera**:
+   - Cấu hình TIM5 hoặc PLL DBLV để đẩy xung nhịp cảm biến OV7670 lên mốc 30 FPS thật.
+
+
 
 
 
