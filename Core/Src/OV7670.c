@@ -232,7 +232,7 @@ const uint8_t OV7670_reg[][2] =
   {OV7670_REG_AEB,              0x75},         // Nguong phoi sang san cao hon (chong sap toi)
   {OV7670_REG_VPT,              0xE4},         // Vung phan ung nhanh cho AGC/AEC
   {OV7670_REG_BRIGHT,           0x20},         // Bu sang ky thuat so (+32) de lam sang toan bo khung hinh
-  {OV7670_REG_COM11,            0x0A},         // Tu dong khu nhap nhay den dien 50Hz (Viet Nam)
+  {OV7670_REG_COM11,            0x08},         // 50Hz banding ON, no auto frame drop
   {OV7670_REG_COM4,             0xC7},         // Edge enhancement, de-noise enabled
   /* gamma curve */
 #if 1
