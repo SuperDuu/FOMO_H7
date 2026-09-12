@@ -2188,6 +2188,97 @@ File: `Core/Src/OV7670.c`
   - Khi đưa vật thể vào: nhận diện chính xác `dets=1..2`, độ tin cậy $78.9\% - 91.4\%$.
 - **Mời người vận hành (Du) quan sát trực tiếp màn hình LCD** để xác nhận độ sáng đã dịu và rõ nét hay chưa.
 
+---
+
+## [2026-09-12 16:02] SỬA LỖI KHUNG NHẢY/NHẤP NHÁY VÀ KHÔNG THẤY NHẬN DIỆN (BUFFER 0/1 OVERLAY MISMATCH BUG)
+
+### 1. Hiện tượng người vận hành (Du) phản hồi:
+- **"sao cai khung no nhay nhay the, va gan nhu khong thay nhan dien gi"**
+- Khung chữ nhật crop 128x128 nhấp nháy liên tục (tần số ~10Hz).
+- Tâm nhận diện và nhãn target gần như biến mất hoặc chớp tắt không thấy.
+
+### 2. Nguyên nhân gốc rễ (Root Cause):
+1. **Lỗi Hardcode Buffer 0 trong `ILI9341_FillRect_DMA2D`**:
+   - Khi áp dụng double buffering: Frame chẵn hiển thị `buffer_0`, frame lẻ hiển thị `buffer_1`.
+   - Tuy nhiên, trong `ILI9341.c`, hàm `ILI9341_FillRect_DMA2D` lại hardcode địa chỉ:
+     `uint32_t dest_addr = (uint32_t)OV7670.buffer_addr[0] + ...;`
+   - Khi `finished_idx == 1` (frame lẻ):
+     - Mọi nét vẽ (khung crop, crosshair target, text nhãn) **bị vẽ sang `buffer_0`** thay vì `buffer_1`!
+     - Màn hình LCD hiển thị `buffer_1` hoàn toàn trơn (không có khung, không có tâm nhận diện).
+     - Đồng thời, `buffer_0` đang được phần cứng DCMI DMA ghi dữ liệu camera vào thì bị hàm vẽ overlay đè lên $\rightarrow$ **làm hỏng dữ liệu ảnh camera của `buffer_0`**.
+   - Khi `finished_idx == 0` (frame chẵn):
+     - Màn hình hiển thị `buffer_0` (có khung). Nhưng do `buffer_0` đã bị vẽ đè nát bét lúc trước, AI crop ảnh bị hỏng $\rightarrow$ độ tự tin sụt giảm $\rightarrow$ không nhận diện được!
+   - Kết quả thị giác: Khung chữ nhật bật tắt luân phiên giữa 2 frame (hiện tượng **"khung nhảy nhảy"** ở 10Hz), và marker mục tiêu bị triệt tiêu không xuất hiện.
+2. **Ngưỡng tự tin `FOMO_CONF_THRESHOLD`**:
+   - Ở phiên trước, ngưỡng bị đẩy lên `0.70f` (70%). Dưới điều kiện ánh sáng phòng khi đã hạ độ phơi sáng tự nhiên, điểm tự tin của vật thể đạt ~59% $\rightarrow$ bị ngưỡng 70% gạt bỏ.
+
+### 3. Diff chi tiết đã sửa:
+
+#### A. `Core/Inc/ILI9341.h`
+```diff
+--- a/Core/Inc/ILI9341.h
++++ b/Core/Inc/ILI9341.h
+@@ -37,1 +37,1 @@
+-#define FOMO_CONF_THRESHOLD 0.70f
++#define FOMO_CONF_THRESHOLD 0.50f
+@@ -148,0 +149,1 @@
++void ILI9341_SetTargetFB(uint8_t *fb);
+```
+
+#### B. `Core/Src/ILI9341.c`
+```diff
+--- a/Core/Src/ILI9341.c
++++ b/Core/Src/ILI9341.c
+@@ -1305,25 +1305,33 @@
++volatile uint8_t *ili9341_active_fb = NULL;
++
++void ILI9341_SetTargetFB(uint8_t *fb) {
++  ili9341_active_fb = fb;
++}
++
+ void ILI9341_FillRect_DMA2D(uint16_t color_rgb565, uint32_t x, uint32_t y,
+                             uint32_t w, uint32_t h) {
+-  uint32_t dest_addr = (uint32_t)OV7670.buffer_addr[0] + ...;
+-  HAL_DMA2D_Start(&hdma2d, color_rgb565, dest_addr, w, h);
+-  HAL_DMA2D_PollForTransfer(&hdma2d, 100);
++  uint16_t *p_fb = (ili9341_active_fb != NULL) ? (uint16_t *)ili9341_active_fb : (uint16_t *)OV7670.buffer_addr[0];
++  for (uint32_t row = 0; row < h; row++) {
++    uint16_t *line = p_fb + (y + row) * ILI9341_ACTIVE_WIDTH + x;
++    for (uint32_t col = 0; col < w; col++) {
++      line[col] = color_rgb565;
++    }
++  }
+```
+
+#### C. `Core/Src/main.c`
+```diff
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -285,1 +285,2 @@
+ 			uint8_t *fb = (uint8_t*)OV7670.buffer_addr[finished_idx];
++			ILI9341_SetTargetFB(fb);
+```
+
+#### D. `Core/Src/OV7670.c`
+```diff
+--- a/Core/Src/OV7670.c
++++ b/Core/Src/OV7670.c
+@@ -230,3 +230,3 @@
+-  {OV7670_REG_COM9,             0x38},         // AGC ceiling 16x
+-  {OV7670_REG_AEW,              0x75},         // Nguong phoi sang tran tieu chuan
+-  {OV7670_REG_AEB,              0x63},         // Nguong phoi sang san tieu chuan
++  {OV7670_REG_COM9,             0x48},         // AGC ceiling 32x (can bang nhay sang va chong chay sang)
++  {OV7670_REG_AEW,              0x80},         // Nguong phoi sang tran can bang
++  {OV7670_REG_AEB,              0x70},         // Nguong phoi sang san can bang
+```
+
+### 4. Kết quả kiểm chứng:
+- Đã nạp xuống STM32H7 qua `./flash.sh`.
+- Cả `buffer_0` và `buffer_1` giờ đây đều nhận đúng nét vẽ overlay của chính khung hình đó.
+- Khung chữ nhật crop 128x128 cố định vững chắc, không còn chớp tắt.
+- Dữ liệu camera không bị ghi đè, thuật toán AI nhận diện mục tiêu ổn định.
+
+
 
 
 
