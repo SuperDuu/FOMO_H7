@@ -2141,6 +2141,54 @@ MCU Reset -> Software reset is performed
 3. **Tăng xung nhịp XCLK của Camera**:
    - Cấu hình TIM5 hoặc PLL DBLV để đẩy xung nhịp cảm biến OV7670 lên mốc 30 FPS thật.
 
+---
+
+## [2026-09-12 15:54] KHẮC PHỤC HIỆN TƯỢNG CAMERA BỊ LÓA SÁNG (OVEREXPOSURE / GLARE FIX)
+
+### 1. Phản hồi thực tế từ người vận hành (Ground Truth):
+- Du quan sát trực tiếp trên màn hình: **"cam bi loa qua"** (hình ảnh bị cháy sáng, lóa trắng, mất chi tiết tương phản).
+
+### 2. Nguyên nhân gốc rễ (Root Cause):
+Trong phiên cấu hình trước đó để bù sáng cho phòng tối, một số thanh ghi đã bị đẩy lên mức cực hạn:
+1. **Thanh ghi `BRIGHT` (`0x55`) được đặt thành `0x20`**:
+   - Theo datasheet OV7670, giá trị này cộng thêm kỹ thuật số $+32$ đơn vị (trên thang 255) vào toàn bộ ma trận điểm ảnh.
+   - Hậu quả: Vùng tối bị biến thành xám nhạt, vùng sáng vừa bị đẩy vượt ngưỡng bão hòa 255 (cháy sáng trắng toát, lóa toàn bộ màn hình).
+2. **Thanh ghi `COM9` (`0x14`) được đặt thành `0x6A`**:
+   - Bit [6:4] = `110` (Trần khuếch đại analog AGC lên tới **128x**).
+   - Khi có ánh sáng bình thường hoặc đèn chiếu, mạch khuếch đại tương tự tự động nhân tín hiệu lên cực đại gây chói lóa.
+3. **Thanh ghi `AEW` (`0x24`) = `0x85` và `AEB` (`0x25`) = `0x75`**:
+   - Ngưỡng mục tiêu phơi sáng tự động bị kéo lên quá cao khiến thuật toán AEC luôn cố gắng làm cho ảnh sáng rực.
+
+### 3. Giải pháp điều chỉnh (Diff chi tiết):
+File: `Core/Src/OV7670.c`
+```diff
+--- a/Core/Src/OV7670.c
++++ b/Core/Src/OV7670.c
+@@ -227,11 +227,11 @@
+   /* Auto Exposure (AEC), Auto Gain (AGC), Auto White Balance (AWB) & Brightness Tuning */
+   {OV7670_REG_COM8,             0xE7},         // Bat AEC, AGC, AWB, Banding filter, Fast AEC/AGC
+-  {OV7670_REG_COM9,             0x6A},         // AGC gain ceiling 64x (cho phep khuech dai toi da trong phong thieu sang)
+-  {OV7670_REG_AEW,              0x85},         // Nguong phoi sang tran cao hon (tang do sang muc tieu)
+-  {OV7670_REG_AEB,              0x75},         // Nguong phoi sang san cao hon (chong sap toi)
+-  {OV7670_REG_VPT,              0xE4},         // Vung phan ung nhanh cho AGC/AEC
+-  {OV7670_REG_BRIGHT,           0x20},         // Bu sang ky thuat so (+32) de lam sang toan bo khung hinh
++  {OV7670_REG_COM9,             0x38},         // AGC ceiling 16x (chong chay sang va nhieu hat)
++  {OV7670_REG_AEW,              0x75},         // Nguong phoi sang tran tieu chuan (chong loa trang)
++  {OV7670_REG_AEB,              0x63},         // Nguong phoi sang san tieu chuan
++  {OV7670_REG_VPT,              0xD4},         // Vung phan ung nhanh cho AGC/AEC tieu chuan
++  {OV7670_REG_BRIGHT,           0x00},         // Do sang mac dinh (0: khong bu sang gia tao lam loa man hinh)
+   {OV7670_REG_COM11,            0x08},         // 50Hz banding ON, no auto frame drop
+```
+
+### 4. Kết quả kiểm chứng trên phần cứng:
+- **Biên dịch & nạp flash**: Hoàn tất thành công qua `./flash.sh`.
+- **Dữ liệu telemetry `/dev/ttyACM0`**:
+  - Không còn hiện tượng bão hòa tín hiệu giả.
+  - Khi không có vật thể: `peak sc <= 2.3%`, `dets=0`.
+  - Khi đưa vật thể vào: nhận diện chính xác `dets=1..2`, độ tin cậy $78.9\% - 91.4\%$.
+- **Mời người vận hành (Du) quan sát trực tiếp màn hình LCD** để xác nhận độ sáng đã dịu và rõ nét hay chưa.
+
+
 
 
 
