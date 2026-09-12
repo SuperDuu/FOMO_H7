@@ -326,9 +326,9 @@ struct
 
 } OV7670;
 
-/* Image buffer */
-static uint8_t buffer[1][OV7670_BUFFER_SIZE];
-//static uint8_t buffer[OV7670_BUFFER_SIZE];
+/* Image buffers: buffer_0 in RAM_D1, buffer_1 in RAM_D2 */
+static uint8_t buffer_0[OV7670_BUFFER_SIZE] __attribute__((aligned(32)));
+static uint8_t buffer_1[OV7670_BUFFER_SIZE] __attribute__((section(".RAM_D2"), aligned(32)));
 /******************************************************************************
  *                       LOCAL FUNCTIONS PROTOTYPES                           *
  ******************************************************************************/
@@ -383,8 +383,8 @@ void OV7670_Init(DCMI_HandleTypeDef *hdcmi, I2C_HandleTypeDef *hi2c, TIM_HandleT
     OV7670_STOP_XLK(OV7670.htim, OV7670.tim_ch);
 
     /* Initialize buffer address */
-    OV7670.buffer_addr[0] = (uint32_t) buffer[0];
-    OV7670.buffer_addr[1] = (uint32_t) buffer[1];
+    OV7670.buffer_addr[0] = (uint32_t) buffer_0;
+    OV7670.buffer_addr[1] = (uint32_t) buffer_1;
 //    OV7670.frameCount = 0;
 //        OV7670.lastTick = HAL_GetTick();
 //        OV7670.fps = 0.0f;
