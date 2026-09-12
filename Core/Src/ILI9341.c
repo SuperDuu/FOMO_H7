@@ -1869,7 +1869,6 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     //DEBUG_TIMEMEAS_START();
-    ILI9341.buff_to_flush = NULL;
     uint32_t chunk_size, chunk_cnt, src_address, nitems, n_chunks;
     uint8_t needToCont;
 
@@ -1884,6 +1883,7 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
     if (chunk_cnt == 0U)
     {
         /* All data chunks are already sent via DMA */
+        ILI9341.buff_to_flush = NULL;
 
         /* Release CSX pin */
         ILI9341_CSX_HIGH();  // SPI CS
