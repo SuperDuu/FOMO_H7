@@ -227,11 +227,11 @@ const uint8_t OV7670_reg[][2] =
 #endif
   /* Auto Exposure (AEC), Auto Gain (AGC), Auto White Balance (AWB) & Brightness Tuning */
   {OV7670_REG_COM8,             0xE7},         // Bat AEC, AGC, AWB, Banding filter, Fast AEC/AGC
-  {OV7670_REG_COM9,             0x38},         // AGC ceiling 16x (chong chay sang va nhieu hat)
-  {OV7670_REG_AEW,              0x75},         // Nguong phoi sang tran tieu chuan (chong loa trang)
-  {OV7670_REG_AEB,              0x63},         // Nguong phoi sang san tieu chuan
+  {OV7670_REG_COM9,             0x48},         // AGC ceiling 32x (can bang nhay sang va chong chay sang)
+  {OV7670_REG_AEW,              0x80},         // Nguong phoi sang tran can bang
+  {OV7670_REG_AEB,              0x70},         // Nguong phoi sang san can bang
   {OV7670_REG_VPT,              0xD4},         // Vung phan ung nhanh cho AGC/AEC tieu chuan
-  {OV7670_REG_BRIGHT,           0x00},         // Do sang mac dinh (0: khong bu sang gia tao lam loa man hinh)
+  {OV7670_REG_BRIGHT,           0x00},         // Do sang tu nhien (khong bu sang gia tao lam loa man hinh)
   {OV7670_REG_COM11,            0x08},         // 50Hz banding ON, no auto frame drop
   {OV7670_REG_COM4,             0xC7},         // Edge enhancement, de-noise enabled
   /* gamma curve */
