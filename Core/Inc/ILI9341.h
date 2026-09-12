@@ -34,7 +34,7 @@
 #define CROP_WIDTH  240
 #define CROP_HEIGHT 240
 #define FOMO_CROP_SIZE 240
-#define FOMO_CONF_THRESHOLD 0.70f
+#define FOMO_CONF_THRESHOLD 0.50f
 //#define MAX_DETECTIONS 3
 #define ILI9341_PORTRAIT                    0
 #define ILI9341_LANDSCAPE                   1
@@ -146,6 +146,7 @@ void LCD_PrintStringColor(int x, int y, const char* str, uint16_t color_rgb565);
 void Draw_Rectangle_Outline(uint32_t x, uint32_t y, uint32_t  width, uint32_t height, uint16_t color_rgb565);
 void Draw_Crosshair(uint32_t cx, uint32_t cy, uint32_t r, uint16_t color_rgb565);
 void Draw_Target_Marker(uint32_t cx, uint32_t cy, uint32_t size, uint16_t color_rgb565);
+void ILI9341_SetTargetFB(uint8_t *fb);
 void ILI9341_FillRect_DMA2D(uint16_t color_rgb565, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void LCD_DrawChar_DMA2D(uint32_t x, uint32_t y, char c, uint16_t color_rgb565) ;
 void Crop_and_Convert_RGB565_to_RGB888(const uint8_t *src, uint8_t *dst, uint32_t src_width, uint32_t src_height, uint32_t dst_width, uint32_t dst_height);
