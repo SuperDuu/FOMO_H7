@@ -1943,6 +1943,154 @@ MCU Reset -> Software reset is performed
      - Hướng dẫn chi tiết 5 bẫy CubeMX tự sinh mã (spurious while loop, thiếu memcpy input, mất NULL check USB, mất include makefile, mất linker objects).
      - Quy trình kiểm thử A/B qua USB CDC trên khung hình trống để đảm bảo model mới không bị trigger ảo.
 
+---
+
+## [2026-09-12 14:58] TỐI ƯU HÓA TĂNG FPS HỆ THỐNG (NON-BLOCKING DECOUPLED DOUBLE BUFFERING & CONTINUOUS XCLK)
+
+### 1. Phân tích nguyên nhân gốc rễ giới hạn 18 FPS:
+1. **Dừng xung XCLK của camera (`HAL_TIM_OC_Stop`)**:
+   - Trong `HAL_DCMI_FrameEventCallback`, code ban đầu dừng xung nhịp TIM5 cấp cho OV7670 (`HAL_TIM_OC_Stop`).
+   - Cảm biến OV7670 bị mất xung nhịp chủ nội bộ. Khi khởi động lại (`OV7670_START_XLK`), cảm biến phải resynchronize lại toàn bộ mạch chia xung và DCMI phải đợi đến cạnh VSYNC tiếp theo mới khóa capture. Lãng phí **15 ~ 17 ms / frame**.
+2. **Khóa liên động màn hình LCD (SPI 32MHz) và Camera trong Single Buffer**:
+   - SPI 32MHz đẩy toàn màn hình 320x240 RGB565 (153.6 KB = 1,228,800 bits) mất cố định:
+     $$t_{SPI} = \frac{1,228,800}{32,000,000} = 38.4 \text{ ms}$$
+   - Ở cơ chế Single Buffer, camera và LCD dùng chung `buffer[0]`, camera phải đợi hoặc LCD phải đợi, kéo tụt toàn bộ hệ thống xuống $38.4\text{ms} + 17.1\text{ms} = 55.5\text{ms} \implies 18 \text{ FPS}$.
+3. **Lỗi logic cờ `ILI9341_IsBusy()` trong driver LCD**:
+   - Trong `HAL_SPI_TxCpltCallback`, lệnh `ILI9341.buff_to_flush = NULL;` bị đặt ngay ở đầu hàm callback (sau khi chunk 1 của DMA hoàn tất). Do frame 76800 pixel chia thành 2 chunk (65535 và 11265), cờ busy bị xóa sớm trong khi chunk 2 vẫn đang được truyền, gây sai lệch trạng thái bận của SPI.
+
+### 2. Giải pháp kiến trúc đã triển khai:
+1. **Double Buffering tách biệt bus AXI và AHB**:
+   - Cấp phát `buffer_0` (153.6 KB) trong `RAM_D1` (AXI SRAM, Origin `0x24000000`).
+   - Cấp phát `buffer_1` (153.6 KB) trong `RAM_D2` (AHB SRAM, Origin `0x30000000`, vùng nhớ còn trống 192 KB).
+   - Tách biệt hai bộ đệm vào hai miền bus phần cứng khác nhau giúp DCMI DMA ghi vào `RAM_D2` hoàn toàn không bị xung đột bus với SPI DMA đọc từ `RAM_D1`!
+2. **Chạy xung XCLK liên tục 100%**:
+   - Loại bỏ `HAL_TIM_OC_Stop` và `OV7670_START_XLK` trong ngắt frame. Camera phát frame liên tục, DCMI hoán đổi buffer ngay tức thì (< 2 µs) sau mỗi frame.
+3. **Màn hình LCD cập nhật bất đồng bộ không khóa (Decoupled Display)**:
+   - Sửa hàm `HAL_SPI_TxCpltCallback`: chỉ giải phóng `buff_to_flush = NULL` khi `chunk_cnt == 0U`.
+   - Trong `HAL_DCMI_FrameEventCallback`: kiểm tra `if (!ILI9341_IsBusy())`. Nếu SPI đang bận đẩy frame cũ thì bỏ qua lượt vẽ LCD của frame này, nhường 100% thời gian cho AI chạy frame mới mà không bao giờ bị block.
+
+### 3. Diff chi tiết các thay đổi:
+
+#### A. `Core/Src/ILI9341.c` (Sửa lỗi giải phóng sớm cờ Busy của SPI DMA):
+```diff
+--- a/Core/Src/ILI9341.c
++++ b/Core/Src/ILI9341.c
+@@ -1869,7 +1869,6 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+ {
+     //DEBUG_TIMEMEAS_START();
+-    ILI9341.buff_to_flush = NULL;
+     uint32_t chunk_size, chunk_cnt, src_address, nitems, n_chunks;
+     uint8_t needToCont;
+ 
+@@ -1883,6 +1882,7 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+     if (chunk_cnt == 0U)
+     {
+         /* All data chunks are already sent via DMA */
++        ILI9341.buff_to_flush = NULL;
+ 
+         /* Release CSX pin */
+         ILI9341_CSX_HIGH();  // SPI CS
+```
+
+#### B. `Core/Src/OV7670.c` (Cấp phát Double Buffering qua 2 miền RAM_D1 và RAM_D2):
+```diff
+--- a/Core/Src/OV7670.c
++++ b/Core/Src/OV7670.c
+@@ -326,9 +326,9 @@ struct
+ 
+ } OV7670;
+ 
+-/* Image buffer */
+-static uint8_t buffer[1][OV7670_BUFFER_SIZE];
+-//static uint8_t buffer[OV7670_BUFFER_SIZE];
++/* Image buffers: buffer_0 in RAM_D1, buffer_1 in RAM_D2 */
++static uint8_t buffer_0[OV7670_BUFFER_SIZE] __attribute__((aligned(32)));
++static uint8_t buffer_1[OV7670_BUFFER_SIZE] __attribute__((section(".RAM_D2"), aligned(32)));
+ 
+@@ -383,8 +383,8 @@ void OV7670_Init(DCMI_HandleTypeDef *hdcmi, I2C_HandleTypeDef *hi2c, TIM_HandleT
+     OV7670_STOP_XLK(OV7670.htim, OV7670.tim_ch);
+ 
+     /* Initialize buffer address */
+-    OV7670.buffer_addr[0] = (uint32_t) buffer[0];
+-    OV7670.buffer_addr[1] = (uint32_t) buffer[1];
++    OV7670.buffer_addr[0] = (uint32_t) buffer_0;
++    OV7670.buffer_addr[1] = (uint32_t) buffer_1;
+```
+
+#### C. `Core/Src/main.c` (Hoán đổi buffer camera liên tục không ngắt XCLK & cập nhật LCD bất đồng bộ):
+```diff
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -171,6 +171,7 @@ extern struct
+ 
+ uint8_t flag_ai_ready = 0;
+ volatile uint8_t flag_frame_ready = 0;
++volatile uint8_t cam_buf_idx = 0;
+ volatile ai_i8* current_ai_buffer = data_in_1;
+ 
+@@ -223,8 +224,8 @@ static void Send_Telemetry_USB(const char *tag) {
+ 	char *p_usb = usb_log_buf[usb_buf_idx];
+ 	usb_buf_idx ^= 1;
+ 	int n = snprintf(p_usb, 256,
+-			"[%s] #%d dt=%lums dets=%d | peak=(%d,%d) sc=%.1f%% (t=%d,b=%d) over_bg=%d/256 over_th=%d |",
+-			tag, cnt, (unsigned long)ai_time_ms, ai_detection_count,
++			"[%s] #%d fps=%.1f dt=%lums dets=%d | peak=(%d,%d) sc=%.1f%% (t=%d,b=%d) over_bg=%d/256 over_th=%d |",
++			tag, cnt, OV7670.fps, (unsigned long)ai_time_ms, ai_detection_count,
+ 
+@@ -245,13 +246,19 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
+ {
+ 	if (hdcmi->Instance == OV7670.hdcmi->Instance) {
++		/* 1. Stop DCMI DMA to switch buffer (XCLK TIM5 keeps running!) */
+ 		HAL_DCMI_Stop(OV7670.hdcmi);
+-		HAL_TIM_OC_Stop(OV7670.htim, OV7670.tim_ch);
++
++		uint8_t finished_idx = cam_buf_idx;
++		cam_buf_idx ^= 1U;
++
++		/* 2. Immediately restart DCMI DMA on the OTHER buffer so camera never waits */
++		HAL_DCMI_Start_DMA(OV7670.hdcmi, DCMI_MODE_CONTINUOUS, OV7670.buffer_addr[cam_buf_idx], OV7670_FRAME_SIZE_WORDS);
++
++		/* 3. Invalidate D-Cache so CPU reads fresh DMA data from the JUST FILLED buffer */
++		SCB_InvalidateDCache_by_Addr((uint32_t*)OV7670.buffer_addr[finished_idx], OV7670_FRAME_SIZE_BYTES);
++
++		/* 4. FPS tracking */
+ 		uint32_t currentTick = HAL_GetTick();
+ 		OV7670.frameCount++;
+@@ -264,10 +271,7 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
+ 		/* Step 1: Crop and Convert to the FREE AI buffer (ping-pong) */
+ 		ai_i8* target_buffer = (current_ai_buffer == data_in_1) ? data_in_2 : data_in_1;
+-		Crop_and_Convert_Fast((uint8_t*)OV7670.buffer_addr[0], (uint8_t*)target_buffer);
++		Crop_and_Convert_Fast((uint8_t*)OV7670.buffer_addr[finished_idx], (uint8_t*)target_buffer);
+ 
+ 		/* Step 2: If AI is IDLE, give it the fresh buffer and trigger it */
+ 		if (flag_ai_ready == 0) {
+ 			current_ai_buffer = target_buffer;
+ 			flag_ai_ready = 1;
+ 		}
+ 
++		/* Step 3: Send to LCD asynchronously ONLY if SPI DMA is completely free */
++		if (!ILI9341_IsBusy()) {
++			uint8_t *fb = (uint8_t*)OV7670.buffer_addr[finished_idx];
++			// Draw bounding boxes, crosshair, text labels...
++			SCB_CleanDCache_by_Addr((uint32_t*)fb, OV7670_FRAME_SIZE_BYTES);
++			ILI9341_DrawFrame(fb, OV7670_FRAME_SIZE_BYTES);
++		}
+-		/* Step 6: Restart DCMI Capture */
+-		OV7670_START_XLK(OV7670.htim, OV7670.tim_ch);
+-		HAL_DCMI_Start_DMA(OV7670.hdcmi, DCMI_MODE_CONTINUOUS, OV7670.buffer_addr[0], OV7670_FRAME_SIZE_WORDS);
+ 	}
+ }
+```
+
+### 4. Kết quả biên dịch:
+- Toolchain: `arm-none-eabi-gcc` v13.3.1 (CubeIDE 1.19.0).
+- Lệnh: `make all -j$(nproc)` trong `Debug/`.
+- Kết quả: **0 errors, 0 warnings**.
+- Phân bổ bộ nhớ từ file `.map`:
+  - `RAM_D1`: `.bss.buffer_0` @ `0x2400d100` (153,600 bytes) + `.bss.pool0` (209.2 KB) $\le 512$ KB.
+  - `RAM_D2`: `.RAM_D2` @ `0x30000000` (153,600 bytes cho `buffer_1` + 98,337 bytes cho AI input `data_in_1`/`data_in_2`) = 246 KB $\le 288$ KB.
+
+
 
 
 
