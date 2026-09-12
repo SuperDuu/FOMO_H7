@@ -171,6 +171,7 @@ extern struct
 
 uint8_t flag_ai_ready = 0;
 volatile uint8_t flag_frame_ready = 0;
+volatile uint8_t cam_buf_idx = 0;
 volatile ai_i8* current_ai_buffer = data_in_1;
 void Set_AI_Input_Buffer(ai_i8* buffer);
 
@@ -222,8 +223,8 @@ static void Send_Telemetry_USB(const char *tag) {
 	char *p_usb = usb_log_buf[usb_buf_idx];
 	usb_buf_idx ^= 1;
 	int n = snprintf(p_usb, 256,
-			"[%s] #%d dt=%lums dets=%d | peak=(%d,%d) sc=%.1f%% (t=%d,b=%d) over_bg=%d/256 over_th=%d |",
-			tag, cnt, (unsigned long)ai_time_ms, ai_detection_count,
+			"[%s] #%d fps=%.1f dt=%lums dets=%d | peak=(%d,%d) sc=%.1f%% (t=%d,b=%d) over_bg=%d/256 over_th=%d |",
+			tag, cnt, OV7670.fps, (unsigned long)ai_time_ms, ai_detection_count,
 			ai_peak_gx, ai_peak_gy, ai_peak_score * 100.0f,
 			(int)ai_peak_tgt, (int)ai_peak_bg,
 			ai_cells_over_bg, ai_cells_over_conf);
@@ -245,13 +246,19 @@ static void Send_Telemetry_USB(const char *tag) {
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
 	if (hdcmi->Instance == OV7670.hdcmi->Instance) {
+		/* 1. Stop DCMI DMA to switch buffer (XCLK TIM5 keeps running!) */
 		HAL_DCMI_Stop(OV7670.hdcmi);
-		HAL_TIM_OC_Stop(OV7670.htim, OV7670.tim_ch);
 
-		/* Invalidate D-Cache so CPU reads fresh DMA data from the JUST FILLED buffer */
-		SCB_InvalidateDCache_by_Addr((uint32_t*)OV7670.buffer_addr[0], OV7670_FRAME_SIZE_BYTES);
+		uint8_t finished_idx = cam_buf_idx;
+		cam_buf_idx ^= 1U;
 
-		/* FPS tracking (lightweight, OK in ISR) */
+		/* 2. Immediately restart DCMI DMA on the OTHER buffer so camera never waits */
+		HAL_DCMI_Start_DMA(OV7670.hdcmi, DCMI_MODE_CONTINUOUS, OV7670.buffer_addr[cam_buf_idx], OV7670_FRAME_SIZE_WORDS);
+
+		/* 3. Invalidate D-Cache so CPU reads fresh DMA data from the JUST FILLED buffer */
+		SCB_InvalidateDCache_by_Addr((uint32_t*)OV7670.buffer_addr[finished_idx], OV7670_FRAME_SIZE_BYTES);
+
+		/* 4. FPS tracking */
 		uint32_t currentTick = HAL_GetTick();
 		OV7670.frameCount++;
 		if (currentTick - OV7670.lastTick >= 500) {
@@ -265,48 +272,45 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 
 		/* Step 1: Crop and Convert to the FREE AI buffer (ping-pong) */
 		ai_i8* target_buffer = (current_ai_buffer == data_in_1) ? data_in_2 : data_in_1;
-		Crop_and_Convert_Fast((uint8_t*)OV7670.buffer_addr[0], (uint8_t*)target_buffer);
+		Crop_and_Convert_Fast((uint8_t*)OV7670.buffer_addr[finished_idx], (uint8_t*)target_buffer);
 
-		/* Step 2: Draw overlays directly into framebuffer (DMA2D) */
-		Draw_Rectangle_Outline((ILI9341_ACTIVE_WIDTH - FOMO_CROP_SIZE) / 2,
-							   (ILI9341_ACTIVE_HEIGHT - FOMO_CROP_SIZE) / 2,
-							   FOMO_CROP_SIZE, FOMO_CROP_SIZE, 0x7BEF);
-
-		int drawn_count = 0;
-		for (int i = 0; i < 5; i++) {
-			if (ai_score[i] < FOMO_CONF_THRESHOLD || ai_score[i] <= 0.0f) continue;
-
-			/* Vẽ chuẩn FOMO: Crosshair dấu cộng tại tâm + ô vuông cố định 16x16 quanh tâm */
-			Draw_Target_Marker(ai_x[i], ai_y[i], 16, 0x07E0);
-
-			build_fomo_label(label, (int)(ai_score[i] * 100), ai_x[i], ai_y[i]);
-			int label_x = (ai_x[i] >= 45) ? (ai_x[i] - 45) : 2;
-			if (label_x > 180) label_x = 180;
-			int label_y = (ai_y[i] >= 16) ? (ai_y[i] - 16) : (ai_y[i] + 12);
-			LCD_PrintStringColor(label_x, label_y, label, 0x07E0);
-
-			drawn_count++;
-			if (drawn_count >= 4) break; /* Cho phép vẽ tối đa 4 target mạnh nhất */
-		}
-
-		build_fps_label(label, (int)(OV7670.fps * 10), (int)ai_time_ms);
-		LCD_PrintStringColor((320 - FOMO_CROP_SIZE) / 2, 2, label, 0x07E0);
-
-		/* Step 3: Clean D-Cache before SPI DMA reads the framebuffer */
-		SCB_CleanDCache_by_Addr((uint32_t*)OV7670.buffer_addr[0], OV7670_FRAME_SIZE_BYTES);
-
-		/* Step 4: Send frame to LCD via SPI DMA */
-		ILI9341_DrawFrame((uint8_t*)OV7670.buffer_addr[0], OV7670_FRAME_SIZE_BYTES);
-
-		/* Step 5: If AI is IDLE, give it the fresh buffer and trigger it */
+		/* Step 2: If AI is IDLE, give it the fresh buffer and trigger it */
 		if (flag_ai_ready == 0) {
 			current_ai_buffer = target_buffer;
 			flag_ai_ready = 1;
 		}
 
-		/* Step 6: Restart DCMI Capture */
-		OV7670_START_XLK(OV7670.htim, OV7670.tim_ch);
-		HAL_DCMI_Start_DMA(OV7670.hdcmi, DCMI_MODE_CONTINUOUS, OV7670.buffer_addr[0], OV7670_FRAME_SIZE_WORDS);
+		/* Step 3: Send to LCD asynchronously ONLY if SPI DMA is completely free */
+		if (!ILI9341_IsBusy()) {
+			uint8_t *fb = (uint8_t*)OV7670.buffer_addr[finished_idx];
+
+			/* Draw overlays directly into this finished framebuffer */
+			Draw_Rectangle_Outline((ILI9341_ACTIVE_WIDTH - FOMO_CROP_SIZE) / 2,
+								   (ILI9341_ACTIVE_HEIGHT - FOMO_CROP_SIZE) / 2,
+								   FOMO_CROP_SIZE, FOMO_CROP_SIZE, 0x7BEF);
+
+			int drawn_count = 0;
+			for (int i = 0; i < 5; i++) {
+				if (ai_score[i] < FOMO_CONF_THRESHOLD || ai_score[i] <= 0.0f) continue;
+				Draw_Target_Marker(ai_x[i], ai_y[i], 16, 0x07E0);
+				build_fomo_label(label, (int)(ai_score[i] * 100), ai_x[i], ai_y[i]);
+				int label_x = (ai_x[i] >= 45) ? (ai_x[i] - 45) : 2;
+				if (label_x > 180) label_x = 180;
+				int label_y = (ai_y[i] >= 16) ? (ai_y[i] - 16) : (ai_y[i] + 12);
+				LCD_PrintStringColor(label_x, label_y, label, 0x07E0);
+				drawn_count++;
+				if (drawn_count >= 4) break;
+			}
+
+			build_fps_label(label, (int)(OV7670.fps * 10), (int)ai_time_ms);
+			LCD_PrintStringColor((320 - FOMO_CROP_SIZE) / 2, 2, label, 0x07E0);
+
+			/* Clean D-Cache before SPI DMA reads the framebuffer */
+			SCB_CleanDCache_by_Addr((uint32_t*)fb, OV7670_FRAME_SIZE_BYTES);
+
+			/* Send frame to LCD via SPI DMA (non-blocking) */
+			ILI9341_DrawFrame(fb, OV7670_FRAME_SIZE_BYTES);
+		}
 	}
 }
 
@@ -496,7 +500,7 @@ int main(void)
   {
     /* USER CODE END WHILE */
 
-  MX_X_CUBE_AI_Process();
+//  MX_X_CUBE_AI_Process(); /* Spurious CubeMX call removed: inference only on flag_ai_ready */
     /* USER CODE BEGIN 3 */
 #if (CURRENT_APP_MODE == APP_MODE_STATIC_TEST)
 	  Process_Static_Test_Frame(0);
