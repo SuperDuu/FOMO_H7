@@ -283,6 +283,7 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 		/* Step 3: Send to LCD asynchronously ONLY if SPI DMA is completely free */
 		if (!ILI9341_IsBusy()) {
 			uint8_t *fb = (uint8_t*)OV7670.buffer_addr[finished_idx];
+			ILI9341_SetTargetFB(fb);
 
 			/* Draw overlays directly into this finished framebuffer */
 			Draw_Rectangle_Outline((ILI9341_ACTIVE_WIDTH - FOMO_CROP_SIZE) / 2,
